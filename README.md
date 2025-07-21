@@ -1,8 +1,6 @@
 # Linkter
 
-A script to check a list of files for broken links and other potential link issues.
-
-***
+A bash script to check a list of files for broken links and other potential link issues.
 
 ## Usage
 
@@ -13,8 +11,6 @@ A script to check a list of files for broken links and other potential link issu
     * A single starting URL (e.g., `https://example.com`) to begin a recursive crawl.
 * **`optional-prefix`**: An optional string to prefix the name of the report file and to name a directory for the output files.
 * **`--check-passed`**: An optional flag to enable recursive checking when providing a `url-list-file`. This is enabled automatically when a `starting-url` is provided instead.
-
-***
 
 ## Features
 
@@ -28,8 +24,6 @@ A script to check a list of files for broken links and other potential link issu
 * **Session resumption**: If a scan is interrupted, it can be resumed from where it left off, preventing the need to start over from scratch.
 * **Organized reporting**: Generates a clean, timestamped report file that groups all found issues by the page they appeared on and provides a final summary of all error types.
 * **Highly portable**: Runs on almost any Unix-like system with no dependencies besides pcregrep.
-
-***
 
 ## Advanced usage
 
@@ -46,8 +40,6 @@ If no prefix is provided, all files will be created in the current directory.
 The easiest way to perform a deep crawl of a website is to provide a single **`starting-url`** as the first argument. When you do this, the recursive check is enabled automatically. The script will start at the given URL, find all links on that page, check them, and then recursively check any of those links that belong to the same website.
 
 You can also enable this feature when using a file of URLs by adding the `--check-passed` flag.
-
-***
 
 ## Limitations
 
