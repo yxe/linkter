@@ -2,7 +2,7 @@
 #
 # Linkter: a link linter -> shell edition
 # Author: hi@ilia.im
-# Version: 1.1
+# Version: 1.2
 # Updated: July 22, 2025
 
 #### Script setup
@@ -11,6 +11,7 @@
 CONF_FILE="linkter.conf"
 RUN_FILE="linkter-run"
 resume_run=false
+debug_mode=false
 
 # Detect system type for compatibility in date commands
 if [[ "$(uname)" == "Darwin" ]]; then
@@ -75,6 +76,15 @@ get_file_timestamp() {
     fi
 }
 
+# Get a file's content hash as a sha256 string
+get_content_hash() {
+    if [[ "$SYSTEM" == "MACOS" ]]; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        sha256sum "$1" | awk '{print $1}'
+    fi
+}
+
 # Check if a given content-type string represents a binary file
 is_binary_content_type() {
     local content_type="$1"
@@ -103,6 +113,40 @@ is_binary_content_type() {
     return 1
 }
 
+# Resolve a relative or absolute URL against a base URL
+# Usage: resolve_url "http://example.com/path/to/page.html" "../../style.css"
+resolve_url() {
+    local base_url=$1
+    local href=$2
+    local resolved_url
+
+    # Return if href is already a full url
+    if [[ "$href" =~ ^https?:// ]]; then
+        resolved_url="$href"
+    # Handle protocol-relative urls
+    elif [[ "$href" =~ ^// ]]; then
+        resolved_url="https:${href}"
+    # Handle root-relative urls
+    elif [[ "$href" =~ ^/ ]]; then
+        local domain
+        domain=$(echo "$base_url" | awk -F/ '{print $1"//"$3}')
+        resolved_url="${domain}${href}"
+    # Handle all other relative urls
+    else
+        local base_path
+        base_path="${base_url%/*}/"
+        resolved_url="${base_path}${href}"
+    fi
+
+    # Normalize the path, resolving /./ and /../
+    resolved_url=$(echo "$resolved_url" | sed 's|/\./|/|g')
+    while echo "$resolved_url" | grep -q '[^/][^/]*/\.\./'; do
+        resolved_url=$(echo "$resolved_url" | sed 's|[^/][^/]*/\.\./||')
+    done
+
+    echo "$resolved_url"
+}
+
 #### Script phases
 ################################################################################
 
@@ -120,6 +164,36 @@ download_phase() {
 
     # Clear or create the link issues file
     > "$download_issues"
+
+    # Create the content hashes file if it doesn't exist
+    touch "$content_hashes"
+
+    # If using existing files, generate hashes and delete duplicates
+    if [ "$download_existing" -eq 0 ] && [ -d "$final_download_dir" ] && [ ! -s "$content_hashes" ]; then
+        echo -e "${COLOR_CYAN}Content hashes file is empty. Generating from existing files and checking for duplicates...${COLOR_NC}"
+        local temp_unique_hashes
+        temp_unique_hashes=$(mktemp)
+
+        for file in "$final_download_dir"/*; do
+            if [ -f "$file" ]; then
+                local current_hash
+                current_hash=$(get_content_hash "$file")
+
+                # Check if we've already seen this hash in this session
+                if grep -Fxq "$current_hash" "$temp_unique_hashes"; then
+                    echo -e "${COLOR_YELLOW}Duplicate content detected. Deleting redundant file: $(basename "$file")${COLOR_NC}"
+                    rm "$file"
+                # First time seeing this hash, record it
+                else
+                    echo "$current_hash" >> "$temp_unique_hashes"
+                fi
+            fi
+        done
+
+        # Replace the final hashes file with our unique set
+        mv "$temp_unique_hashes" "$content_hashes"
+        echo -e "${COLOR_GREEN}Content hash generation and de-duplication complete.${COLOR_NC}"
+    fi
 
     # Get total number of urls for progress indicator
     local total_urls
@@ -142,7 +216,7 @@ download_phase() {
         done
 
         if [ "$should_skip" = true ]; then
-            echo -e "${COLOR_CYAN}Skipping URL listed in skip_files: $url${COLOR_NC}"
+            echo -e "\n${COLOR_CYAN}Skipping URL listed in skip_files: $url${COLOR_NC}"
             continue
         fi
 
@@ -151,7 +225,7 @@ download_phase() {
         local filename=${no_proto//\//_}
         local filepath="$final_download_dir/$filename"
 
-        echo -e "${COLOR_BLUE}[$current_url_num/$total_urls] Checking URL: $url...${COLOR_NC}"
+        echo -e "\n${COLOR_BLUE}[$current_url_num/$total_urls] Checking URL: $url...${COLOR_NC}"
 
         # Skip if file exists and config is set to not re-download
         if [ "$download_existing" -eq 0 ] && [ -f "$filepath" ]; then
@@ -170,11 +244,31 @@ download_phase() {
             header_args=("-H" "If-Modified-Since: $last_modified")
         fi
 
-        # Make a head request first to check headers before downloading the body
+        # Pre-flight check to get final url and status code before downloading body
         local response_headers
         response_headers=$(mktemp)
+
+        local curl_preflight_output
+        curl_preflight_output=$(curl -s -L -w '%{url_effective}\n%{http_code}' --connect-timeout 10 -o /dev/null -D "$response_headers" "${header_args[@]}" "$url")
+
         local http_code
-        http_code=$(curl --connect-timeout 10 -s -L -D "$response_headers" -w "%{http_code}" -o /dev/null "${header_args[@]}" "$url")
+        http_code=$(echo "$curl_preflight_output" | tail -n1)
+        local effective_url
+        effective_url=$(echo "$curl_preflight_output" | head -n1)
+
+        # Check for off-site redirects before proceeding
+        local original_domain
+        original_domain=$(echo "$url" | awk -F/ '{print $3}' | sed 's/^www\.//')
+        local effective_domain
+        effective_domain=$(echo "$effective_url" | awk -F/ '{print $3}' | sed 's/^www\.//')
+
+        if [[ "$original_domain" != "$effective_domain" ]]; then
+            echo -e "${COLOR_YELLOW}Off-site redirect detected. Original URL redirected to a different domain.${COLOR_NC}"
+            echo "$url -> $effective_url" >> "$download_issues"
+            echo -e "\tOff-site redirect" >> "$download_issues"
+            rm "$response_headers"
+            continue
+        fi
 
         # Check for 304 not modified
         if [ "$http_code" -eq 304 ]; then
@@ -202,33 +296,22 @@ download_phase() {
             temp_content_file=$(mktemp)
 
             if curl -s -L -o "$temp_content_file" "$url"; then
-                local is_duplicate=false
-                local matched_file=""
+                # Check for duplicate content via hashing
+                local content_hash
+                content_hash=$(get_content_hash "$temp_content_file")
 
-                # Iterate through already downloaded files
-                for existing_file in "$final_download_dir"/*; do
-                    [ -f "$existing_file" ] || continue
-
-                    if cmp -s "$temp_content_file" "$existing_file"; then
-                        is_duplicate=true
-                        matched_file=$(basename "$existing_file")
-                        break
-                    fi
-                done
-
-                # Log the issue and skip the download
-                if [ "$is_duplicate" = true ]; then
-
-                    echo -e "${COLOR_CYAN}Content of $url is identical to existing file '$matched_file'. Skipping download.${COLOR_NC}"
+                if grep -Fxq "$content_hash" "$content_hashes"; then
+                    echo -e "${COLOR_CYAN}Content of $url is identical to a previously downloaded file. Skipping download.${COLOR_NC}"
                     echo "$url" >> "$download_issues"
-                    echo -e "\tSkipped (line $current_url_num): content is identical to existing file '$matched_file'." >> "$download_issues"
+                    echo -e "\tSkipped (line $current_url_num): content is identical to an existing file." >> "$download_issues"
                     rm "$temp_content_file"
                     continue
                 fi
 
-                # If not a duplicate, move the temp file to its final destination
+                # If not a duplicate, move the temp file and record the hash
                 echo "Downloading to $filepath..."
                 mv "$temp_content_file" "$filepath"
+                echo "$content_hash" >> "$content_hashes"
 
                 # Get the last-modified header from the server
                 local last_modified_header
@@ -279,7 +362,7 @@ update_run_value() {
 
     # Check if key exists and update it, otherwise add it
     if grep -q "^$key=" "$RUN_FILE"; then
-        sed "s/^$key=.*/$key=$value/" "$RUN_FILE" > "$temp_file" && mv "$temp_file" "$RUN_FILE"
+        sed "s|^$key=.*|$key=$value|" "$RUN_FILE" > "$temp_file" && mv "$temp_file" "$RUN_FILE"
     else
         echo "$key=$value" >> "$RUN_FILE"
     fi
@@ -366,8 +449,6 @@ checking_phase() {
             canonical_url="https://${filename//_//}"
         fi
 
-        local base_url=$(echo "$canonical_url" | awk -F/ '{print $1 "//" $3}')
-
         # Check if the canonical url is in the skip_files array
         local should_skip_file=false
 
@@ -388,31 +469,9 @@ checking_phase() {
         # Initialize issue tracking for this file
         declare -a file_issues=()
 
-        # Find all anchor tags with their line numbers
-        while IFS=: read -r line_num anchor; do
+        while IFS=: read -r line_num href; do
             local message=""
             local issue_type=""
-
-            # Check for empty links
-            if [ "$skip_empty_check" -eq 0 ] && [[ "$anchor" =~ ^\<a[[:space:]][^\>]*\>([[:space:]]*|(\&nbsp\;)*[[:space:]]*)\<\/a\>$ ]]; then
-                # If configured, ignore empty anchors that have no href attribute
-                if [ "$skip_empty_without_href" -eq 1 ] && [[ ! "$anchor" =~ href= ]]; then
-                    continue
-                fi
-
-                message="- Empty link: $anchor (line $line_num)"
-                issue_type="empty"
-
-                echo -e "${COLOR_YELLOW}${message}${COLOR_NC}"
-                file_issues+=("\t$message")
-                ((total_issues_count++))
-                increment_issue_count "$issue_type"
-                continue # No href to check, so skip to the next anchor
-            fi
-
-            # Extract href and check for various conditions
-            local href
-            href=$(echo "$anchor" | grep -o '\shref="[^"]*"' | cut -d'"' -f2)
 
             # Skip if no href or special types
             if [[ -z "$href" || "$href" =~ ^# || "$href" =~ ^mailto: || "$href" =~ ^tel: || "$href" =~ ^fax: || "$href" =~ ^javascript: || "$href" =~ ^sms: || "$href" =~ ^ftp: ]]; then
@@ -421,7 +480,9 @@ checking_phase() {
 
             # Skip if href appears to be part of a js string concatenation
             if [[ "$href" =~ [[:space:]]\+[[:space:]] ]]; then
-                echo -e "${COLOR_CYAN}Skipping probable JavaScript in href: $href (line $line_num)${COLOR_NC}"
+                if [ "$debug_mode" = true ]; then
+                    echo -e "${COLOR_CYAN}Skipping probable JavaScript in href: $href (line $line_num)${COLOR_NC}"
+                fi
                 continue
             fi
 
@@ -455,27 +516,12 @@ checking_phase() {
 
             # Build full url from potentially modified href
             local full_url
-
-            if [[ "$href" =~ ^// ]]; then
-                full_url="https:${href}"
-            elif [[ "$href" =~ ^/ ]]; then
-                full_url="${base_url}${href}"
-            elif [[ "$href" =~ ^\.\.?/ ]]; then
-                full_url="${canonical_url%/*}/${href}"
-            elif [[ ! "$href" =~ ^https?:// ]]; then
-                if [[ "$canonical_url" =~ /$ ]]; then
-                    full_url="${canonical_url}${href}"
-                else
-                    full_url="${canonical_url%/*}/${href}"
-                fi
-            else
-                full_url="$href"
-            fi
-
-            full_url=$(echo "$full_url" | sed 's|/\./|/|g; s|/[^/]*/\.\./|/|g; s|//$|/|')
+            full_url=$(resolve_url "$canonical_url" "$href")
 
             if grep -Fxq "$full_url" "$passed_links"; then
-                echo -e "${COLOR_CYAN}Previously verified OK: $full_url (line $line_num).${COLOR_NC}"
+                if [ "$debug_mode" = true ]; then
+                    echo -e "${COLOR_CYAN}Previously verified OK: $full_url (line $line_num).${COLOR_NC}"
+                fi
                 continue
             fi
 
@@ -508,7 +554,9 @@ checking_phase() {
 
             if [[ "$status_code" == "200" ]]; then
                 echo "$full_url" >> "$passed_links"
-                echo -e "${COLOR_GREEN}$status_code $status_message: $full_url (line $line_num)${COLOR_NC}"
+                if [ "$debug_mode" = true ]; then
+                    echo -e "${COLOR_GREEN}$status_code $status_message: $full_url (line $line_num)${COLOR_NC}"
+                fi
                 continue
             fi
 
@@ -539,7 +587,9 @@ checking_phase() {
 
             if [ "$should_ignore" -eq 1 ]; then
                 echo "$full_url" >> "$passed_links"
-                echo -e "${COLOR_GREEN}Ignoring $status_code from whitelisted prefix: $full_url (line $line_num).${COLOR_NC}"
+                if [ "$debug_mode" = true ]; then
+                    echo -e "${COLOR_GREEN}Ignoring $status_code from whitelisted prefix: $full_url (line $line_num).${COLOR_NC}"
+                fi
                 continue
             fi
 
@@ -573,9 +623,38 @@ checking_phase() {
                 increment_issue_count "$issue_type"
             else
                 echo "$full_url" >> "$passed_links"
-                echo -e "${COLOR_GREEN}$status_code $status_message: $full_url (line $line_num).${COLOR_NC}"
+                if [ "$debug_mode" = true ]; then
+                    echo -e "${COLOR_GREEN}$status_code $status_message: $full_url (line $line_num).${COLOR_NC}"
+                fi
             fi
-        done < <(pcregrep --buffer-size=200K -Mino '<a\s[^>]*>(?s:.*?)</a>' "$file")
+        done < <(grep -o -n -E '<a\s[^>]*href="[^"]*"' "$file" | sed -E 's/^([0-9]+):.*href="([^"]*)".*/\1:\2/')
+
+        # Check for empty links using the single-line file method
+        if [ "$skip_empty_check" -eq 0 ]; then
+            local single_line_file
+            single_line_file=$(mktemp)
+
+            # Create a version of the file with all newlines removed
+            tr -d '\n\r' < "$file" > "$single_line_file"
+
+            # Grep for empty anchor tags (allowing for whitespace and &nbsp;)
+            while read -r empty_tag; do
+                # If configured, ignore empty tags that have no href attribute
+                if [ "$skip_empty_without_href" -eq 1 ] && [[ ! "$empty_tag" =~ href= ]]; then
+                    continue
+                fi
+
+                local message="- Empty link: $empty_tag"
+                local issue_type="empty"
+
+                echo -e "${COLOR_YELLOW}${message}${COLOR_NC}"
+                file_issues+=("\t$message")
+                ((total_issues_count++))
+                increment_issue_count "$issue_type"
+            done < <(grep -oE '<a[^>]*>\s*(&nbsp;)*\s*</a>' "$single_line_file")
+
+            rm "$single_line_file"
+        fi
 
         # Output all issues for this file together and update the run state
         if [ ${#file_issues[@]} -gt 0 ]; then
@@ -612,7 +691,7 @@ checking_phase() {
 
 # Finalize the report with a summary header
 finalize_report() {
-    echo -e "\n\033[1;34m--- Finalizing report ---\033[0m"
+    echo -e "\n${COLOR_BLUE}--- Finalizing report ---${COLOR_NC}"
 
     if [ ! -f "$RUN_FILE" ]; then
         echo "Warning: could not find run file. Cannot generate final report header."
@@ -637,7 +716,9 @@ finalize_report() {
         if [[ $key == count_* ]]; then
             local label=${key#count_} # Remove 'count_' prefix
 
-            if [[ "$label" == "empty" ]]; then
+            if [[ "$label" == "offsite_redirect" ]]; then
+                label="Off-site redirects"
+            elif [[ "$label" == "empty" ]]; then
                 label="Empty links"
             elif [[ "$label" == "whitespace" ]]; then
                 label="Whitespace links"
@@ -645,6 +726,8 @@ finalize_report() {
                 label="Non-HTTPS links"
             elif [[ "$label" == "connection_failed" ]]; then
                 label="Connection failures"
+            else
+                label="HTTP $label errors"
             fi
 
             summary+="### $label: $value\n"
@@ -665,7 +748,7 @@ finalize_report() {
 
     rm "$RUN_FILE"
 
-    echo -e "\n\033[1;32mProcessing complete. Report saved to $final_link_report.\033[0m"
+    echo -e "\n${COLOR_GREEN}Processing complete. Report saved to $final_link_report.${COLOR_NC}"
 }
 
 # Recursively check passed links if the flag is enabled
@@ -748,6 +831,9 @@ recursive_check_phase() {
             
             # Update the global input_file variable for the next run of the phases
             input_file="$next_input_file"
+
+            # Save the current input file to the run state for resuming
+            update_run_value "current_input_file" "$input_file"
             
             # Re-run the core phases with the new list of links
             download_phase
@@ -767,6 +853,7 @@ main() {
     local check_passed_flag=false
     local positional_args=()
     local temp_url_file="" # Path to a temporary file if needed
+    local custom_conf_file=""
 
     # Parse arguments for flags and positional args
     while [[ $# -gt 0 ]]; do
@@ -775,9 +862,13 @@ main() {
                 check_passed_flag=true
                 shift
                 ;;
+            --debug)
+                debug_mode=true
+                shift
+                ;;
             --config)
                 if [[ -n "$2" ]]; then
-                    CONF_FILE="$2"
+                    custom_conf_file="$2"
                     shift 2
                 else
                     echo "Error: --config requires a file path." >&2
@@ -794,19 +885,29 @@ main() {
     # Restore positional arguments
     set -- "${positional_args[@]}"
 
-    # Load config
+    # Load default config first
     if [ ! -f "$CONF_FILE" ]; then
-        echo "Error: configuration file '$CONF_FILE' not found!"
+        echo "Error: default configuration file '$CONF_FILE' not found!"
         exit 1
     fi
 
-    # Source the config file to load variables and arrays
     source "./$CONF_FILE"
-    echo "Configuration loaded from $CONF_FILE."
+    echo "Default configuration loaded from $CONF_FILE."
+
+    # If a custom config was passed, source it to override defaults
+    if [[ -n "$custom_conf_file" ]]; then
+        if [ ! -f "$custom_conf_file" ]; then
+            echo "Error: Custom configuration file '$custom_conf_file' not found!" >&2
+            exit 1
+        fi
+
+        source "./$custom_conf_file"
+        echo "Configuration overridden with values from $custom_conf_file."
+    fi
 
     if [ $# -eq 0 ]; then
         echo "Error: no URL list file or starting URL provided."
-        echo "Usage: $0 <url-list-file | starting-url> [optional-prefix] [--check-passed] [--config <file>]"
+        echo "Usage: $0 <url-list-file | starting-url> [optional-prefix] [--check-passed] [--debug] [--config <file>]"
         exit 1
     fi
 
@@ -845,6 +946,7 @@ main() {
         passed_links="$work_dir/$passed_links"
         files_checked="$work_dir/$files_checked"
         download_issues="$work_dir/$download_issues"
+        content_hashes="$work_dir/$content_hashes"
     fi
 
     final_download_dir="$work_dir/${prefix:+$prefix-}$download_directory"
@@ -860,6 +962,12 @@ main() {
             resume_run=true
             source "./$RUN_FILE"
             final_link_report="$work_dir/$report_filename"
+
+            # If a recursive check was interrupted, set the input file to continue
+            if [[ -n "$current_input_file" && -f "$current_input_file" ]]; then
+                input_file="$current_input_file"
+                echo "Resuming with input file: $input_file"
+            fi
         else
             rm "$RUN_FILE"
             echo "Removed '$RUN_FILE'. Starting a fresh scan."
@@ -876,6 +984,8 @@ main() {
             prompt_user "Existing download directory '$final_download_dir' found. Re-download all files?" "n"
             if [[ "$choice" == "y" ]]; then
                 rm -rf "$final_download_dir"
+                # Also clear hash file if downloads are cleared
+                > "$content_hashes"
             fi
         fi
 
@@ -890,6 +1000,13 @@ main() {
             prompt_user "Existing checked files log '$files_checked' found. Clear it for a fresh run?" "n"
             if [[ "$choice" == "y" ]]; then
                 > "$files_checked"
+            fi
+        fi
+
+        if [ -f "$content_hashes" ]; then
+            prompt_user "Existing content hash file '$content_hashes' found. Clear it for a fresh run?" "n"
+            if [[ "$choice" == "y" ]]; then
+                > "$content_hashes"
             fi
         fi
 
