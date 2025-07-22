@@ -1,9 +1,9 @@
 #!/bin/bash
 #
-# Linkter: a link linter
+# Linkter: a link linter -> shell edition
 # Author: hi@ilia.im
-# Version: 1.0
-# Updated: July 20, 2025
+# Version: 1.1
+# Updated: July 22, 2025
 
 #### Script setup
 ################################################################################
@@ -11,17 +11,6 @@
 CONF_FILE="linkter.conf"
 RUN_FILE="linkter-run"
 resume_run=false
-
-# Load config
-if [ ! -f "$CONF_FILE" ]; then
-    echo "Error: configuration file not found!"
-    echo "Please ensure '$CONF_FILE' exists in the same directory as the script."
-    exit 1
-fi
-
-# Source the config file to load variables and arrays
-source "./$CONF_FILE"
-echo "Configuration loaded from $CONF_FILE."
 
 # Detect system type for compatibility in date commands
 if [[ "$(uname)" == "Darwin" ]]; then
@@ -141,6 +130,21 @@ download_phase() {
     while IFS= read -r url || [ -n "$url" ]; do
         [ -z "$url" ] && continue # skip empty lines
         ((current_url_num++))
+
+        # Check if the url is in the skip_files array
+        local should_skip=false
+
+        for skip_url in "${skip_files[@]}"; do
+            if [[ "$url" == "$skip_url" ]]; then
+                should_skip=true
+                break
+            fi
+        done
+
+        if [ "$should_skip" = true ]; then
+            echo -e "${COLOR_CYAN}Skipping URL listed in skip_files: $url${COLOR_NC}"
+            continue
+        fi
 
         # Generate a safe filename from the url
         local no_proto=${url#*://}
@@ -362,8 +366,24 @@ checking_phase() {
             canonical_url="https://${filename//_//}"
         fi
 
-        local base_url
-        base_url=$(echo "$canonical_url" | awk -F/ '{print $1 "//" $3}')
+        local base_url=$(echo "$canonical_url" | awk -F/ '{print $1 "//" $3}')
+
+        # Check if the canonical url is in the skip_files array
+        local should_skip_file=false
+
+        for skip_url in "${skip_files[@]}"; do
+            if [[ "$canonical_url" == "$skip_url" ]]; then
+                should_skip_file=true
+                break
+            fi
+        done
+
+        if [ "$should_skip_file" = true ]; then
+            echo -e "${COLOR_PURPLE}Skipping file whose canonical URL is in skip_files: $canonical_url${COLOR_NC}"
+            # Mark file as checked to prevent it from being processed again on resume
+            echo "$file" >> "$files_checked"
+            continue
+        fi
 
         # Initialize issue tracking for this file
         declare -a file_issues=()
@@ -436,7 +456,9 @@ checking_phase() {
             # Build full url from potentially modified href
             local full_url
 
-            if [[ "$href" =~ ^/ ]]; then
+            if [[ "$href" =~ ^// ]]; then
+                full_url="https:${href}"
+            elif [[ "$href" =~ ^/ ]]; then
                 full_url="${base_url}${href}"
             elif [[ "$href" =~ ^\.\.?/ ]]; then
                 full_url="${canonical_url%/*}/${href}"
@@ -553,7 +575,7 @@ checking_phase() {
                 echo "$full_url" >> "$passed_links"
                 echo -e "${COLOR_GREEN}$status_code $status_message: $full_url (line $line_num).${COLOR_NC}"
             fi
-        done < <(pcregrep -Mino '<a\s[^>]*>(?s:.*?)</a>' "$file")
+        done < <(pcregrep --buffer-size=200K -Mino '<a\s[^>]*>(?s:.*?)</a>' "$file")
 
         # Output all issues for this file together and update the run state
         if [ ${#file_issues[@]} -gt 0 ]; then
@@ -753,6 +775,15 @@ main() {
                 check_passed_flag=true
                 shift
                 ;;
+            --config)
+                if [[ -n "$2" ]]; then
+                    CONF_FILE="$2"
+                    shift 2
+                else
+                    echo "Error: --config requires a file path." >&2
+                    exit 1
+                fi
+                ;;
             *)
                 positional_args+=("$1")
                 shift
@@ -763,9 +794,19 @@ main() {
     # Restore positional arguments
     set -- "${positional_args[@]}"
 
+    # Load config
+    if [ ! -f "$CONF_FILE" ]; then
+        echo "Error: configuration file '$CONF_FILE' not found!"
+        exit 1
+    fi
+
+    # Source the config file to load variables and arrays
+    source "./$CONF_FILE"
+    echo "Configuration loaded from $CONF_FILE."
+
     if [ $# -eq 0 ]; then
         echo "Error: no URL list file or starting URL provided."
-        echo "Usage: $0 <url-list-file | starting-url> [optional-prefix] [--check-passed]"
+        echo "Usage: $0 <url-list-file | starting-url> [optional-prefix] [--check-passed] [--config <file>]"
         exit 1
     fi
 
@@ -829,8 +870,7 @@ main() {
         local timestamp
         timestamp=$(date +"%Y-%m-%d-%H-%M")
 
-        local report_base_name="${link_report%.txt}"
-        final_link_report="$work_dir/${prefix:+$prefix-}${report_base_name}-${timestamp}.txt"
+        final_link_report="$work_dir/${prefix:+$prefix-}${link_report}-${timestamp}.txt"
 
         if [ -d "$final_download_dir" ]; then
             prompt_user "Existing download directory '$final_download_dir' found. Re-download all files?" "n"

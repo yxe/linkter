@@ -4,13 +4,14 @@ A bash script to check a list of files for broken links and other potential link
 
 ## Usage
 
-`./linkter.sh <url-list-file | starting-url> [optional-prefix] [--check-passed]`
+`./linkter.sh <url-list-file | starting-url> [optional-prefix] [--check-passed] [--config <file>]`
 
 * **`<url-list-file | starting-url>`**: The starting point for the scan. This can be either:
     * A plain text file with one URL per line that you want to check.
     * A single starting URL (e.g., `https://example.com`) to begin a recursive crawl.
 * **`optional-prefix`**: An optional string to prefix the name of the report file and to name a directory for the output files.
 * **`--check-passed`**: An optional flag to enable recursive checking when providing a `url-list-file`. This is enabled automatically when a `starting-url` is provided instead.
+* **`--config <file>`**: An optional flag to override the default config file with the specified file.
 
 ## Features
 
@@ -37,7 +38,7 @@ If no prefix is provided, all files will be created in the current directory.
 
 ### Recursive checking (`--check-passed`)
 
-The easiest way to perform a deep crawl of a website is to provide a single **`starting-url`** as the first argument. When you do this, the recursive check is enabled automatically. The script will start at the given URL, find all links on that page, check them, and then recursively check any of those links that belong to the same website.
+The easiest way to perform a deep crawl of a website is to provide a single **`starting-url`** as the first argument. When you do this, the recursive check is enabled automatically. The script will start at the given URL, find all links on that page, check them, and then recursively check any of those links that belong to the same website. Use the `skip_files` array in the config file to specify URLs that should be skipped (e.g. archived content).
 
 You can also enable this feature when using a file of URLs by adding the `--check-passed` flag.
 
